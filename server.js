@@ -220,6 +220,86 @@ app.all('/proxy', (req, res) => {
   }
 
   // Make the request
+  proxyRequest(options, res, targetUrl, proxyBase);
+});
+
+// Catch-all route for direct navigation (like /results, /watch, etc)
+app.all('*', (req, res) => {
+  // Skip our defined routes
+  if (req.path === '/' || req.path === '/health' || req.path === '/proxy') {
+    return res.status(404).json({
+      error: 'Not found',
+      path: req.path,
+      usage: '/proxy?url=https://example.com'
+    });
+  }
+
+  // Try to reconstruct the original URL from referrer
+  const referer = req.headers.referer || req.headers.referrer;
+  
+  if (!referer) {
+    return res.status(400).json({
+      error: 'Cannot determine target website',
+      message: 'Direct navigation requires using /proxy?url=...',
+      path: req.path
+    });
+  }
+
+  // Extract the original URL from the referer
+  try {
+    const refererUrl = new URL(referer);
+    const originalUrlParam = refererUrl.searchParams.get('url');
+    
+    if (originalUrlParam) {
+      const originalUrl = new URL(originalUrlParam);
+      const targetUrl = `${originalUrl.protocol}//${originalUrl.host}${req.path}${req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : ''}`;
+      
+      console.log(`[CATCHALL ${req.method}] Reconstructed: ${targetUrl}`);
+      
+      const proxyBase = getProxyBase(req);
+      const options = {
+        url: targetUrl,
+        method: req.method,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': req.headers.accept || '*/*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate',
+          'Referer': originalUrlParam
+        },
+        encoding: null,
+        followRedirect: true,
+        maxRedirects: 5,
+        timeout: 30000,
+        gzip: true
+      };
+
+      if (req.method === 'POST' || req.method === 'PUT') {
+        options.body = req.body;
+        if (req.headers['content-type']) {
+          options.headers['Content-Type'] = req.headers['content-type'];
+        }
+      }
+
+      proxyRequest(options, res, targetUrl, proxyBase);
+    } else {
+      return res.status(400).json({
+        error: 'Cannot determine original URL',
+        path: req.path
+      });
+    }
+  } catch (e) {
+    console.error('Catchall error:', e.message);
+    return res.status(400).json({
+      error: 'Failed to process request',
+      path: req.path,
+      message: e.message
+    });
+  }
+});
+
+// Shared proxy request handler
+function proxyRequest(options, res, targetUrl, proxyBase) {
   request(options, (error, response, body) => {
     if (error) {
       console.error('Request error:', error.message);
@@ -282,7 +362,7 @@ app.all('/proxy', (req, res) => {
       res.send(body);
     }
   });
-});
+}
 
 // 404 handler
 app.use((req, res) => {
