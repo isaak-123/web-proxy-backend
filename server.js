@@ -2,179 +2,299 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const url = require('url');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Enable CORS for all routes
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Store the base URL for current session
-let currentBaseUrl = '';
+// Root route
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    message: 'Proxy server is running',
+    usage: 'Use /proxy?url=https://example.com to proxy a website'
+  });
+});
 
-function rewriteUrl(originalUrl, baseUrl) {
-  if (!originalUrl) return originalUrl;
-  
-  try {
-    // If it's already a full URL
-    if (originalUrl.startsWith('http://') || originalUrl.startsWith('https://')) {
-      return `/proxy?url=${encodeURIComponent(originalUrl)}`;
-    }
-    
-    // If it's a protocol-relative URL
-    if (originalUrl.startsWith('//')) {
-      return `/proxy?url=${encodeURIComponent('https:' + originalUrl)}`;
-    }
-    
-    // If it's a relative URL
-    if (originalUrl.startsWith('/')) {
-      const base = new URL(baseUrl);
-      return `/proxy?url=${encodeURIComponent(base.origin + originalUrl)}`;
-    }
-    
-    // If it's a relative path without leading slash
-    const base = new URL(baseUrl);
-    const resolved = new URL(originalUrl, base.href);
-    return `/proxy?url=${encodeURIComponent(resolved.href)}`;
-  } catch (e) {
-    return originalUrl;
-  }
-}
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', message: 'Proxy server is healthy' });
+});
 
-function rewriteHtml(html, baseUrl) {
-  const $ = cheerio.load(html);
-  
-  // Rewrite links
-  $('a').each((i, elem) => {
-    const href = $(elem).attr('href');
-    if (href) {
-      $(elem).attr('href', rewriteUrl(href, baseUrl));
-    }
-  });
-  
-  // Rewrite images
-  $('img').each((i, elem) => {
-    const src = $(elem).attr('src');
-    if (src) {
-      $(elem).attr('src', rewriteUrl(src, baseUrl));
-    }
-    const srcset = $(elem).attr('srcset');
-    if (srcset) {
-      const rewritten = srcset.split(',').map(s => {
-        const parts = s.trim().split(' ');
-        parts[0] = rewriteUrl(parts[0], baseUrl);
-        return parts.join(' ');
-      }).join(', ');
-      $(elem).attr('srcset', rewritten);
-    }
-  });
-  
-  // Rewrite scripts
-  $('script').each((i, elem) => {
-    const src = $(elem).attr('src');
-    if (src) {
-      $(elem).attr('src', rewriteUrl(src, baseUrl));
-    }
-  });
-  
-  // Rewrite stylesheets
-  $('link[rel="stylesheet"]').each((i, elem) => {
-    const href = $(elem).attr('href');
-    if (href) {
-      $(elem).attr('href', rewriteUrl(href, baseUrl));
-    }
-  });
-  
-  // Rewrite forms
-  $('form').each((i, elem) => {
-    const action = $(elem).attr('action');
-    if (action) {
-      $(elem).attr('action', rewriteUrl(action, baseUrl));
-    }
-  });
-  
-  // Inject base tag to help with relative URLs
-  if ($('base').length === 0) {
-    $('head').prepend(`<base href="${baseUrl}">`);
-  }
-  
-  return $.html();
-}
-
-function rewriteCss(css, baseUrl) {
-  // Rewrite url() in CSS
-  return css.replace(/url\(['"]?([^'")]+)['"]?\)/g, (match, urlPath) => {
-    const rewritten = rewriteUrl(urlPath, baseUrl);
-    return `url(${rewritten})`;
-  });
-}
-
+// Main proxy route
 app.get('/proxy', async (req, res) => {
   try {
     const targetUrl = req.query.url;
     
     if (!targetUrl) {
-      return res.status(400).send('URL parameter is required');
+      return res.status(400).json({ 
+        error: 'Missing URL parameter',
+        usage: 'Use /proxy?url=https://example.com'
+      });
     }
-    
+
+    // Validate URL
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(targetUrl);
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid URL format' });
+    }
+
     console.log('Proxying:', targetUrl);
-    
-    const response = await axios.get(targetUrl, {
+
+    // Fetch the target URL
+    const response = await axios({
+      method: 'GET',
+      url: targetUrl,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
       },
       maxRedirects: 5,
       validateStatus: () => true,
+      responseType: 'arraybuffer',
+      timeout: 15000
     });
-    
+
     const contentType = response.headers['content-type'] || '';
-    
+    const data = response.data;
+
     // Set CORS headers
     res.set('Access-Control-Allow-Origin', '*');
-    
-    // Handle HTML
+    res.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    // Handle different content types
     if (contentType.includes('text/html')) {
-      const rewrittenHtml = rewriteHtml(response.data, targetUrl);
-      res.set('Content-Type', 'text/html');
-      return res.send(rewrittenHtml);
+      try {
+        const html = data.toString('utf-8');
+        const rewrittenHtml = rewriteHtml(html, targetUrl);
+        res.set('Content-Type', 'text/html; charset=utf-8');
+        return res.send(rewrittenHtml);
+      } catch (err) {
+        console.error('HTML rewrite error:', err);
+        res.set('Content-Type', contentType);
+        return res.send(data);
+      }
     }
-    
-    // Handle CSS
+
     if (contentType.includes('text/css')) {
-      const rewrittenCss = rewriteCss(response.data, targetUrl);
-      res.set('Content-Type', 'text/css');
-      return res.send(rewrittenCss);
+      try {
+        const css = data.toString('utf-8');
+        const rewrittenCss = rewriteCss(css, targetUrl);
+        res.set('Content-Type', 'text/css; charset=utf-8');
+        return res.send(rewrittenCss);
+      } catch (err) {
+        console.error('CSS rewrite error:', err);
+        res.set('Content-Type', contentType);
+        return res.send(data);
+      }
     }
-    
-    // Handle JavaScript - pass through as-is
-    if (contentType.includes('javascript') || contentType.includes('json')) {
-      res.set('Content-Type', contentType);
-      return res.send(response.data);
-    }
-    
-    // Handle images and other binary content
-    if (contentType.includes('image') || contentType.includes('octet-stream')) {
-      res.set('Content-Type', contentType);
-      return res.send(response.data);
-    }
-    
-    // Default: send as-is
+
+    // For everything else (images, JS, fonts, etc), pass through
     res.set('Content-Type', contentType);
-    res.send(response.data);
-    
+    res.send(data);
+
   } catch (error) {
     console.error('Proxy error:', error.message);
-    res.status(500).send(`Proxy error: ${error.message}`);
+    
+    if (error.code === 'ENOTFOUND') {
+      return res.status(404).json({ error: 'Website not found or unreachable' });
+    }
+    
+    if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+      return res.status(504).json({ error: 'Request timeout - website took too long to respond' });
+    }
+
+    res.status(500).json({ 
+      error: 'Proxy error',
+      message: error.message 
+    });
   }
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Proxy server is running' });
+// Handle POST requests for form submissions
+app.post('/proxy', async (req, res) => {
+  try {
+    const targetUrl = req.query.url;
+    
+    if (!targetUrl) {
+      return res.status(400).json({ error: 'Missing URL parameter' });
+    }
+
+    console.log('POST Proxying:', targetUrl);
+
+    const response = await axios({
+      method: 'POST',
+      url: targetUrl,
+      data: req.body,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Content-Type': req.headers['content-type'] || 'application/x-www-form-urlencoded',
+      },
+      maxRedirects: 5,
+      validateStatus: () => true,
+      responseType: 'arraybuffer',
+      timeout: 15000
+    });
+
+    const contentType = response.headers['content-type'] || '';
+    const data = response.data;
+
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Content-Type', contentType);
+    
+    if (contentType.includes('text/html')) {
+      const html = data.toString('utf-8');
+      const rewrittenHtml = rewriteHtml(html, targetUrl);
+      return res.send(rewrittenHtml);
+    }
+
+    res.send(data);
+
+  } catch (error) {
+    console.error('POST Proxy error:', error.message);
+    res.status(500).json({ error: 'Proxy error', message: error.message });
+  }
+});
+
+function rewriteUrl(originalUrl, baseUrl) {
+  if (!originalUrl || originalUrl === '#' || originalUrl.startsWith('javascript:') || originalUrl.startsWith('data:') || originalUrl.startsWith('mailto:') || originalUrl.startsWith('tel:')) {
+    return originalUrl;
+  }
+
+  try {
+    let targetUrl;
+
+    if (originalUrl.startsWith('http://') || originalUrl.startsWith('https://')) {
+      targetUrl = originalUrl;
+    } else if (originalUrl.startsWith('//')) {
+      targetUrl = 'https:' + originalUrl;
+    } else if (originalUrl.startsWith('/')) {
+      const base = new URL(baseUrl);
+      targetUrl = base.origin + originalUrl;
+    } else {
+      targetUrl = new URL(originalUrl, baseUrl).href;
+    }
+
+    return `/proxy?url=${encodeURIComponent(targetUrl)}`;
+  } catch (e) {
+    console.error('URL rewrite error:', e.message, 'for', originalUrl);
+    return originalUrl;
+  }
+}
+
+function rewriteHtml(html, baseUrl) {
+  try {
+    const $ = cheerio.load(html, {
+      decodeEntities: false,
+      xmlMode: false
+    });
+
+    // Add base tag
+    if ($('base').length === 0) {
+      $('head').prepend(`<base href="${baseUrl}">`);
+    }
+
+    // Rewrite all href attributes
+    $('[href]').each((i, elem) => {
+      const href = $(elem).attr('href');
+      if (href) {
+        $(elem).attr('href', rewriteUrl(href, baseUrl));
+      }
+    });
+
+    // Rewrite all src attributes
+    $('[src]').each((i, elem) => {
+      const src = $(elem).attr('src');
+      if (src) {
+        $(elem).attr('src', rewriteUrl(src, baseUrl));
+      }
+    });
+
+    // Rewrite srcset
+    $('[srcset]').each((i, elem) => {
+      const srcset = $(elem).attr('srcset');
+      if (srcset) {
+        const rewritten = srcset.split(',').map(s => {
+          const parts = s.trim().split(/\s+/);
+          if (parts[0]) {
+            parts[0] = rewriteUrl(parts[0], baseUrl);
+          }
+          return parts.join(' ');
+        }).join(', ');
+        $(elem).attr('srcset', rewritten);
+      }
+    });
+
+    // Rewrite form actions
+    $('form[action]').each((i, elem) => {
+      const action = $(elem).attr('action');
+      if (action) {
+        $(elem).attr('action', rewriteUrl(action, baseUrl));
+      }
+    });
+
+    // Rewrite data attributes that might contain URLs
+    $('[data-src], [data-url]').each((i, elem) => {
+      const dataSrc = $(elem).attr('data-src');
+      if (dataSrc) {
+        $(elem).attr('data-src', rewriteUrl(dataSrc, baseUrl));
+      }
+      const dataUrl = $(elem).attr('data-url');
+      if (dataUrl) {
+        $(elem).attr('data-url', rewriteUrl(dataUrl, baseUrl));
+      }
+    });
+
+    return $.html();
+  } catch (err) {
+    console.error('HTML parsing error:', err);
+    return html;
+  }
+}
+
+function rewriteCss(css, baseUrl) {
+  try {
+    return css.replace(/url\s*\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, quote, urlPath) => {
+      const rewritten = rewriteUrl(urlPath.trim(), baseUrl);
+      return `url(${quote}${rewritten}${quote})`;
+    });
+  } catch (err) {
+    console.error('CSS rewrite error:', err);
+    return css;
+  }
+}
+
+// Handle OPTIONS for CORS preflight
+app.options('*', cors());
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ 
+    error: 'Not found',
+    message: 'Use /proxy?url=https://example.com to proxy a website',
+    availableRoutes: ['/', '/health', '/proxy']
+  });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({ error: 'Internal server error', message: err.message });
 });
 
 app.listen(PORT, () => {
-  console.log(`Proxy server running on port ${PORT}`);
+  console.log(`✅ Proxy server running on port ${PORT}`);
+  console.log(`📡 Health check: http://localhost:${PORT}/health`);
+  console.log(`🌐 Usage: http://localhost:${PORT}/proxy?url=https://example.com`);
 });
