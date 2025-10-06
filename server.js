@@ -25,10 +25,18 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Proxy server is healthy' });
 });
 
-// Main proxy route
-app.get('/proxy', async (req, res) => {
+// Catch-all proxy route to handle all paths
+app.all('/proxy*', async (req, res) => {
   try {
-    const targetUrl = req.query.url;
+    let targetUrl = req.query.url;
+    
+    // If no URL query param, check if path contains URL
+    if (!targetUrl) {
+      const pathUrl = req.path.replace('/proxy/', '').replace('/proxy', '');
+      if (pathUrl && pathUrl.startsWith('http')) {
+        targetUrl = pathUrl;
+      }
+    }
     
     if (!targetUrl) {
       return res.status(400).json({ 
@@ -37,27 +45,38 @@ app.get('/proxy', async (req, res) => {
       });
     }
 
+    // Decode if double-encoded
+    try {
+      targetUrl = decodeURIComponent(targetUrl);
+    } catch (e) {
+      // Already decoded
+    }
+
     // Validate URL
     let parsedUrl;
     try {
       parsedUrl = new URL(targetUrl);
     } catch (e) {
-      return res.status(400).json({ error: 'Invalid URL format' });
+      return res.status(400).json({ error: 'Invalid URL format', receivedUrl: targetUrl });
     }
 
     console.log('Proxying:', targetUrl);
 
     // Fetch the target URL
+    const method = req.method.toUpperCase();
     const response = await axios({
-      method: 'GET',
+      method: method,
       url: targetUrl,
+      data: method !== 'GET' ? req.body : undefined,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
+        'Upgrade-Insecure-Requests': '1',
+        'Referer': parsedUrl.origin,
+        ...(req.headers['content-type'] && { 'Content-Type': req.headers['content-type'] })
       },
       maxRedirects: 5,
       validateStatus: () => true,
@@ -72,6 +91,11 @@ app.get('/proxy', async (req, res) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.set('Access-Control-Allow-Headers', 'Content-Type');
+    
+    // Remove security headers that block iframes
+    res.removeHeader('X-Frame-Options');
+    res.removeHeader('Content-Security-Policy');
+    res.set('X-Frame-Options', 'ALLOWALL');
 
     // Handle different content types
     if (contentType.includes('text/html')) {
@@ -124,47 +148,8 @@ app.get('/proxy', async (req, res) => {
 
 // Handle POST requests for form submissions
 app.post('/proxy', async (req, res) => {
-  try {
-    const targetUrl = req.query.url;
-    
-    if (!targetUrl) {
-      return res.status(400).json({ error: 'Missing URL parameter' });
-    }
-
-    console.log('POST Proxying:', targetUrl);
-
-    const response = await axios({
-      method: 'POST',
-      url: targetUrl,
-      data: req.body,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Content-Type': req.headers['content-type'] || 'application/x-www-form-urlencoded',
-      },
-      maxRedirects: 5,
-      validateStatus: () => true,
-      responseType: 'arraybuffer',
-      timeout: 15000
-    });
-
-    const contentType = response.headers['content-type'] || '';
-    const data = response.data;
-
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Content-Type', contentType);
-    
-    if (contentType.includes('text/html')) {
-      const html = data.toString('utf-8');
-      const rewrittenHtml = rewriteHtml(html, targetUrl);
-      return res.send(rewrittenHtml);
-    }
-
-    res.send(data);
-
-  } catch (error) {
-    console.error('POST Proxy error:', error.message);
-    res.status(500).json({ error: 'Proxy error', message: error.message });
-  }
+  // This is now handled by the catch-all route above
+  res.redirect(307, req.url);
 });
 
 function rewriteUrl(originalUrl, baseUrl) {
@@ -199,6 +184,10 @@ function rewriteHtml(html, baseUrl) {
       decodeEntities: false,
       xmlMode: false
     });
+
+    // Remove or modify security headers in meta tags
+    $('meta[http-equiv="Content-Security-Policy"]').remove();
+    $('meta[http-equiv="X-Frame-Options"]').remove();
 
     // Add base tag
     if ($('base').length === 0) {
@@ -245,7 +234,7 @@ function rewriteHtml(html, baseUrl) {
     });
 
     // Rewrite data attributes that might contain URLs
-    $('[data-src], [data-url]').each((i, elem) => {
+    $('[data-src], [data-url], [data-href]').each((i, elem) => {
       const dataSrc = $(elem).attr('data-src');
       if (dataSrc) {
         $(elem).attr('data-src', rewriteUrl(dataSrc, baseUrl));
@@ -254,7 +243,56 @@ function rewriteHtml(html, baseUrl) {
       if (dataUrl) {
         $(elem).attr('data-url', rewriteUrl(dataUrl, baseUrl));
       }
+      const dataHref = $(elem).attr('data-href');
+      if (dataHref) {
+        $(elem).attr('data-href', rewriteUrl(dataHref, baseUrl));
+      }
     });
+
+    // Inject JavaScript to intercept navigation
+    const injectedScript = `
+    <script>
+      (function() {
+        // Intercept all clicks on links
+        document.addEventListener('click', function(e) {
+          var target = e.target.closest('a');
+          if (target && target.href) {
+            var href = target.getAttribute('href');
+            if (href && !href.startsWith('javascript:') && !href.startsWith('#')) {
+              e.preventDefault();
+              window.location.href = href;
+            }
+          }
+        }, true);
+        
+        // Intercept form submissions
+        document.addEventListener('submit', function(e) {
+          var form = e.target;
+          if (form.action) {
+            e.preventDefault();
+            var formData = new FormData(form);
+            var method = form.method.toUpperCase() || 'GET';
+            
+            if (method === 'GET') {
+              var params = new URLSearchParams(formData).toString();
+              window.location.href = form.action + (params ? '?' + params : '');
+            } else {
+              fetch(form.action, {
+                method: method,
+                body: formData
+              }).then(response => response.text()).then(html => {
+                document.open();
+                document.write(html);
+                document.close();
+              });
+            }
+          }
+        }, true);
+      })();
+    </script>
+    `;
+    
+    $('body').append(injectedScript);
 
     return $.html();
   } catch (err) {
