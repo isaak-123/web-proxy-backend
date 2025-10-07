@@ -2,6 +2,7 @@ const express = require('express');
 const request = require('request');
 const cheerio = require('cheerio');
 const url = require('url');
+const iconv = require('iconv-lite');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -43,6 +44,79 @@ function getProxyBase(req) {
   const protocol = req.headers['x-forwarded-proto'] || req.protocol;
   const host = req.headers['x-forwarded-host'] || req.get('host');
   return `${protocol}://${host}`;
+}
+
+// Detect charset from Content-Type header
+function detectCharsetFromContentType(contentType) {
+  if (!contentType) return null;
+
+  const charsetMatch = contentType.match(/charset=([^;]+)/i);
+  if (charsetMatch) {
+    return charsetMatch[1].trim().replace(/['"]/g, '');
+  }
+  return null;
+}
+
+// Detect charset from HTML content
+function detectCharsetFromHTML(buffer) {
+  // Try to read the first 1024 bytes as ASCII to look for meta tags
+  const htmlStart = buffer.slice(0, 1024).toString('ascii');
+
+  // Look for <meta charset="...">
+  const charsetMatch = htmlStart.match(/<meta[^>]+charset=["']?([^"'\s>]+)/i);
+  if (charsetMatch) {
+    return charsetMatch[1].trim();
+  }
+
+  // Look for <meta http-equiv="Content-Type" content="...">
+  const httpEquivMatch = htmlStart.match(/<meta[^>]+http-equiv=["']?Content-Type["']?[^>]+content=["']?[^"'>]*charset=([^"'\s;>]+)/i);
+  if (httpEquivMatch) {
+    return httpEquivMatch[1].trim();
+  }
+
+  return null;
+}
+
+// Convert buffer to string using detected charset
+function decodeBuffer(buffer, contentType) {
+  // Try Content-Type header first
+  let charset = detectCharsetFromContentType(contentType);
+
+  // If it's HTML and no charset in header, check HTML meta tags
+  if (!charset && contentType && contentType.includes('text/html')) {
+    charset = detectCharsetFromHTML(buffer);
+  }
+
+  // Default to UTF-8
+  if (!charset) {
+    charset = 'utf-8';
+  }
+
+  // Normalize charset name
+  charset = charset.toLowerCase().replace(/[_]/g, '-');
+
+  // Handle common aliases
+  const charsetAliases = {
+    'iso-8859-1': 'latin1',
+    'iso8859-1': 'latin1',
+    'windows-1252': 'cp1252',
+    'utf8': 'utf-8'
+  };
+
+  charset = charsetAliases[charset] || charset;
+
+  try {
+    // Check if iconv-lite supports this encoding
+    if (iconv.encodingExists(charset)) {
+      return iconv.decode(buffer, charset);
+    } else {
+      console.warn(`Unsupported charset: ${charset}, falling back to UTF-8`);
+      return buffer.toString('utf-8');
+    }
+  } catch (e) {
+    console.error(`Error decoding with charset ${charset}:`, e.message);
+    return buffer.toString('utf-8');
+  }
 }
 
 // Rewrite URLs in content - using path-based encoding for self-describing URLs
@@ -820,14 +894,14 @@ function proxyRequest(options, res, targetUrl, proxyBase) {
     try {
       // Handle HTML
       if (contentType.includes('text/html')) {
-        const html = body.toString('utf-8');
+        const html = decodeBuffer(body, contentType);
         const rewritten = rewriteHTML(html, targetUrl, proxyBase);
         return res.send(rewritten);
       }
 
       // Handle CSS
       if (contentType.includes('text/css')) {
-        const css = body.toString('utf-8');
+        const css = decodeBuffer(body, contentType);
         const rewritten = rewriteCSS(css, targetUrl, proxyBase);
         return res.send(rewritten);
       }
