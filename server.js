@@ -81,18 +81,22 @@ function detectCharsetFromHTML(buffer) {
 function decodeBuffer(buffer, contentType) {
   // Try Content-Type header first
   let charset = detectCharsetFromContentType(contentType);
+  console.log(`[CHARSET] Content-Type: ${contentType}, detected from header: ${charset}`);
 
   // If it's HTML and no charset in header, check HTML meta tags
   if (!charset && contentType && contentType.includes('text/html')) {
     charset = detectCharsetFromHTML(buffer);
+    console.log(`[CHARSET] Detected from HTML meta: ${charset}`);
   }
 
   // Default to UTF-8
   if (!charset) {
     charset = 'utf-8';
+    console.log(`[CHARSET] No charset detected, using default: utf-8`);
   }
 
   // Normalize charset name
+  const originalCharset = charset;
   charset = charset.toLowerCase().replace(/[_]/g, '-');
 
   // Handle common aliases
@@ -104,17 +108,20 @@ function decodeBuffer(buffer, contentType) {
   };
 
   charset = charsetAliases[charset] || charset;
+  console.log(`[CHARSET] Using charset: ${charset} (original: ${originalCharset})`);
 
   try {
     // Check if iconv-lite supports this encoding
     if (iconv.encodingExists(charset)) {
-      return iconv.decode(buffer, charset);
+      const decoded = iconv.decode(buffer, charset);
+      console.log(`[CHARSET] Successfully decoded ${buffer.length} bytes using ${charset}`);
+      return decoded;
     } else {
-      console.warn(`Unsupported charset: ${charset}, falling back to UTF-8`);
+      console.warn(`[CHARSET] Unsupported charset: ${charset}, falling back to UTF-8`);
       return buffer.toString('utf-8');
     }
   } catch (e) {
-    console.error(`Error decoding with charset ${charset}:`, e.message);
+    console.error(`[CHARSET] Error decoding with charset ${charset}:`, e.message);
     return buffer.toString('utf-8');
   }
 }
