@@ -91,9 +91,69 @@ function rewriteHTML(html, baseUrl, proxyBase) {
     $('meta[http-equiv="Content-Security-Policy"]').remove();
     $('meta[http-equiv="X-Frame-Options"]').remove();
     $('meta[name="referrer"]').remove();  // Remove referrer policy meta tags
-    
-    // Add permissive referrer policy
-    $('head').prepend('<meta name="referrer" content="unsafe-url">');
+
+    // Add permissive referrer policy and base tag for relative URLs
+    const parsedBase = new URL(baseUrl);
+    const proxyBasePath = `${proxyBase}/proxy/${parsedBase.protocol.replace(':', '')}/${parsedBase.host}`;
+
+    $('head').prepend(`
+      <meta name="referrer" content="unsafe-url">
+      <base href="${proxyBasePath}/">
+    `);
+
+    // Inject JavaScript to intercept navigation and fetch requests
+    const injectedScript = `
+      <script>
+        (function() {
+          const proxyBase = '${proxyBase}';
+          const currentProtocol = '${parsedBase.protocol.replace(':', '')}';
+          const currentHost = '${parsedBase.host}';
+
+          // Function to convert URL to proxy format
+          function toProxyURL(url) {
+            try {
+              if (!url || url.startsWith('data:') || url.startsWith('javascript:') ||
+                  url.startsWith('mailto:') || url.startsWith('tel:') || url === '#') {
+                return url;
+              }
+
+              let absoluteUrl;
+              if (url.startsWith('//')) {
+                absoluteUrl = 'https:' + url;
+              } else if (url.startsWith('http://') || url.startsWith('https://')) {
+                absoluteUrl = url;
+              } else if (url.startsWith('/')) {
+                absoluteUrl = currentProtocol + '://' + currentHost + url;
+              } else {
+                return url; // Let base tag handle it
+              }
+
+              const parsed = new URL(absoluteUrl);
+              const protocol = parsed.protocol.replace(':', '');
+              return proxyBase + '/proxy/' + protocol + '/' + parsed.host + parsed.pathname + parsed.search + parsed.hash;
+            } catch (e) {
+              return url;
+            }
+          }
+
+          // Intercept fetch
+          const originalFetch = window.fetch;
+          window.fetch = function(url, options) {
+            const proxiedUrl = toProxyURL(url);
+            return originalFetch(proxiedUrl, options);
+          };
+
+          // Intercept XMLHttpRequest
+          const originalOpen = XMLHttpRequest.prototype.open;
+          XMLHttpRequest.prototype.open = function(method, url, ...args) {
+            const proxiedUrl = toProxyURL(url);
+            return originalOpen.call(this, method, proxiedUrl, ...args);
+          };
+        })();
+      </script>
+    `;
+
+    $('head').prepend(injectedScript);
 
     // Rewrite links
     $('a[href], link[href]').each(function() {
@@ -259,20 +319,20 @@ app.all('/proxy/:protocol?/:host?/*?', (req, res) => {
 app.all('*', (req, res) => {
   // Try to extract origin from referer for JavaScript-generated requests
   const referer = req.headers.referer || req.headers.referrer;
-  
+
   if (referer) {
     try {
       const refererUrl = new URL(referer);
-      
+
       // Check if referer is a proxied URL in path format: /proxy/https/example.com/...
       const pathMatch = refererUrl.pathname.match(/^\/proxy\/(https?)\/([\w.-]+(?:\:\d+)?)(\/.*)?$/);
-      
+
       if (pathMatch) {
         const [, protocol, host] = pathMatch;
         const targetUrl = `${protocol}://${host}${req.path}${req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : ''}`;
-        
+
         console.log(`[CATCHALL ${req.method}] JS request reconstructed: ${targetUrl}`);
-        
+
         const proxyBase = getProxyBase(req);
         const options = {
           url: targetUrl,
@@ -300,12 +360,53 @@ app.all('*', (req, res) => {
 
         return proxyRequest(options, res, targetUrl, proxyBase);
       }
+
+      // Also check if referer contains query-based format: ?url=https://example.com
+      const urlParam = refererUrl.searchParams.get('url');
+      if (urlParam && refererUrl.pathname.includes('/proxy')) {
+        try {
+          const baseUrl = new URL(urlParam);
+          const targetUrl = `${baseUrl.protocol}//${baseUrl.host}${req.path}${req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : ''}`;
+
+          console.log(`[CATCHALL ${req.method}] JS request reconstructed from query: ${targetUrl}`);
+
+          const proxyBase = getProxyBase(req);
+          const options = {
+            url: targetUrl,
+            method: req.method,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Accept': req.headers.accept || '*/*',
+              'Accept-Language': 'en-US,en;q=0.9',
+              'Accept-Encoding': 'gzip, deflate',
+              'Referer': `${baseUrl.protocol}//${baseUrl.host}`
+            },
+            encoding: null,
+            followRedirect: true,
+            maxRedirects: 5,
+            timeout: 30000,
+            gzip: true
+          };
+
+          if (req.method === 'POST' || req.method === 'PUT') {
+            options.body = req.body;
+            if (req.headers['content-type']) {
+              options.headers['Content-Type'] = req.headers['content-type'];
+            }
+          }
+
+          return proxyRequest(options, res, targetUrl, proxyBase);
+        } catch (e) {
+          console.error('Query-based catchall error:', e.message);
+        }
+      }
     } catch (e) {
       console.error('Catchall referer parse error:', e.message);
     }
   }
-  
+
   // No valid referer found
+  console.log(`[CATCHALL FAILED] No valid referer for ${req.method} ${req.path}`);
   res.status(404).json({
     error: 'Not found',
     path: req.path,
