@@ -4,7 +4,7 @@ const cheerio = require('cheerio');
 const url = require('url');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(express.json());
@@ -43,7 +43,7 @@ function getProxyBase(req) {
   return `${protocol}://${host}`;
 }
 
-// Rewrite URLs in content
+// Rewrite URLs in content - using path-based encoding for self-describing URLs
 function rewriteURL(originalUrl, baseUrl, proxyBase) {
   if (!originalUrl) return originalUrl;
   
@@ -68,8 +68,15 @@ function rewriteURL(originalUrl, baseUrl, proxyBase) {
       absoluteUrl = url.resolve(baseUrl, originalUrl);
     }
 
-    // Return proxied URL
-    return `${proxyBase}/proxy?url=${encodeURIComponent(absoluteUrl)}`;
+    // Parse the absolute URL
+    const parsedUrl = new URL(absoluteUrl);
+    
+    // Encode URL as path: /proxy/{protocol}/{host}{path}{search}{hash}
+    // This makes URLs self-describing without relying on referers
+    const protocol = parsedUrl.protocol.replace(':', ''); // http or https
+    const encodedPath = `${proxyBase}/proxy/${protocol}/${parsedUrl.host}${parsedUrl.pathname}${parsedUrl.search}${parsedUrl.hash}`;
+    
+    return encodedPath;
   } catch (e) {
     return originalUrl;
   }
@@ -80,9 +87,13 @@ function rewriteHTML(html, baseUrl, proxyBase) {
   try {
     const $ = cheerio.load(html, { decodeEntities: false });
 
-    // Remove problematic headers
+    // Remove problematic headers and policies
     $('meta[http-equiv="Content-Security-Policy"]').remove();
     $('meta[http-equiv="X-Frame-Options"]').remove();
+    $('meta[name="referrer"]').remove();  // Remove referrer policy meta tags
+    
+    // Add permissive referrer policy
+    $('head').prepend('<meta name="referrer" content="unsafe-url">');
 
     // Rewrite links
     $('a[href], link[href]').each(function() {
@@ -164,21 +175,42 @@ function rewriteCSS(css, baseUrl, proxyBase) {
   }
 }
 
-// Main proxy endpoint
-app.all('/proxy', (req, res) => {
-  let targetUrl = req.query.url;
+// Main proxy endpoint - handles both query-based (?url=) and path-based (/protocol/host/path)
+app.all('/proxy/:protocol?/:host?/*?', (req, res) => {
+  let targetUrl = null;
+  
+  // Check if using new path-based format: /proxy/https/example.com/path
+  if (req.params.protocol && req.params.host) {
+    const protocol = req.params.protocol;
+    const host = req.params.host;
+    
+    // Use originalUrl to preserve exact query string and encoded characters
+    const originalPath = req.originalUrl;
+    const proxyPrefix = `/proxy/${protocol}/${host}`;
+    
+    // Extract everything after /proxy/protocol/host to preserve exact encoding
+    let pathAndQuery = '/';
+    const prefixIndex = originalPath.indexOf(proxyPrefix);
+    if (prefixIndex !== -1) {
+      pathAndQuery = originalPath.substring(prefixIndex + proxyPrefix.length) || '/';
+    }
+    
+    targetUrl = `${protocol}://${host}${pathAndQuery}`;
+  }
+  // Fall back to query-based format: /proxy?url=https://example.com
+  else if (req.query.url) {
+    targetUrl = req.query.url;
+    try {
+      targetUrl = decodeURIComponent(targetUrl);
+    } catch (e) {}
+  }
 
   if (!targetUrl) {
     return res.status(400).json({
-      error: 'Missing URL parameter',
-      usage: '/proxy?url=https://example.com'
+      error: 'Missing URL',
+      usage: '/proxy?url=https://example.com OR /proxy/https/example.com/path'
     });
   }
-
-  // Decode if needed
-  try {
-    targetUrl = decodeURIComponent(targetUrl);
-  } catch (e) {}
 
   // Validate URL
   try {
@@ -223,79 +255,62 @@ app.all('/proxy', (req, res) => {
   proxyRequest(options, res, targetUrl, proxyBase);
 });
 
-// Catch-all route for direct navigation (like /results, /watch, etc)
+// Catch-all route - handles dynamic JS requests (fetch, XHR, forms) by extracting origin from referer
 app.all('*', (req, res) => {
-  // Skip our defined routes
-  if (req.path === '/' || req.path === '/health' || req.path === '/proxy') {
-    return res.status(404).json({
-      error: 'Not found',
-      path: req.path,
-      usage: '/proxy?url=https://example.com'
-    });
-  }
-
-  // Try to reconstruct the original URL from referrer
+  // Try to extract origin from referer for JavaScript-generated requests
   const referer = req.headers.referer || req.headers.referrer;
   
-  if (!referer) {
-    return res.status(400).json({
-      error: 'Cannot determine target website',
-      message: 'Direct navigation requires using /proxy?url=...',
-      path: req.path
-    });
-  }
-
-  // Extract the original URL from the referer
-  try {
-    const refererUrl = new URL(referer);
-    const originalUrlParam = refererUrl.searchParams.get('url');
-    
-    if (originalUrlParam) {
-      const originalUrl = new URL(originalUrlParam);
-      const targetUrl = `${originalUrl.protocol}//${originalUrl.host}${req.path}${req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : ''}`;
+  if (referer) {
+    try {
+      const refererUrl = new URL(referer);
       
-      console.log(`[CATCHALL ${req.method}] Reconstructed: ${targetUrl}`);
+      // Check if referer is a proxied URL in path format: /proxy/https/example.com/...
+      const pathMatch = refererUrl.pathname.match(/^\/proxy\/(https?)\/([\w.-]+(?:\:\d+)?)(\/.*)?$/);
       
-      const proxyBase = getProxyBase(req);
-      const options = {
-        url: targetUrl,
-        method: req.method,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': req.headers.accept || '*/*',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Accept-Encoding': 'gzip, deflate',
-          'Referer': originalUrlParam
-        },
-        encoding: null,
-        followRedirect: true,
-        maxRedirects: 5,
-        timeout: 30000,
-        gzip: true
-      };
+      if (pathMatch) {
+        const [, protocol, host] = pathMatch;
+        const targetUrl = `${protocol}://${host}${req.path}${req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : ''}`;
+        
+        console.log(`[CATCHALL ${req.method}] JS request reconstructed: ${targetUrl}`);
+        
+        const proxyBase = getProxyBase(req);
+        const options = {
+          url: targetUrl,
+          method: req.method,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': req.headers.accept || '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
+            'Referer': `${protocol}://${host}`
+          },
+          encoding: null,
+          followRedirect: true,
+          maxRedirects: 5,
+          timeout: 30000,
+          gzip: true
+        };
 
-      if (req.method === 'POST' || req.method === 'PUT') {
-        options.body = req.body;
-        if (req.headers['content-type']) {
-          options.headers['Content-Type'] = req.headers['content-type'];
+        if (req.method === 'POST' || req.method === 'PUT') {
+          options.body = req.body;
+          if (req.headers['content-type']) {
+            options.headers['Content-Type'] = req.headers['content-type'];
+          }
         }
-      }
 
-      proxyRequest(options, res, targetUrl, proxyBase);
-    } else {
-      return res.status(400).json({
-        error: 'Cannot determine original URL',
-        path: req.path
-      });
+        return proxyRequest(options, res, targetUrl, proxyBase);
+      }
+    } catch (e) {
+      console.error('Catchall referer parse error:', e.message);
     }
-  } catch (e) {
-    console.error('Catchall error:', e.message);
-    return res.status(400).json({
-      error: 'Failed to process request',
-      path: req.path,
-      message: e.message
-    });
   }
+  
+  // No valid referer found
+  res.status(404).json({
+    error: 'Not found',
+    path: req.path,
+    message: 'This path requires a valid referer. Use /proxy?url=https://example.com or /proxy/https/example.com/path to start browsing.'
+  });
 });
 
 // Shared proxy request handler
@@ -325,7 +340,8 @@ function proxyRequest(options, res, targetUrl, proxyBase) {
       if (lowerKey !== 'content-security-policy' &&
           lowerKey !== 'x-frame-options' &&
           lowerKey !== 'content-encoding' &&
-          lowerKey !== 'transfer-encoding') {
+          lowerKey !== 'transfer-encoding' &&
+          lowerKey !== 'referrer-policy') {  // Remove strict referrer policies
         res.set(key, response.headers[key]);
       }
     });
@@ -333,6 +349,8 @@ function proxyRequest(options, res, targetUrl, proxyBase) {
     // Always set these
     res.set('Access-Control-Allow-Origin', '*');
     res.set('X-Frame-Options', 'ALLOWALL');
+    // Set a permissive referrer policy to ensure referers are sent
+    res.set('Referrer-Policy', 'unsafe-url');
 
     try {
       // Handle HTML
@@ -382,6 +400,6 @@ app.use((err, req, res, next) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Proxy server running on port ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Proxy server running on http://0.0.0.0:${PORT}`);
 });
