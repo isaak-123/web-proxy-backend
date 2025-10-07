@@ -46,19 +46,24 @@ function getProxyBase(req) {
 // Rewrite URLs in content - using path-based encoding for self-describing URLs
 function rewriteURL(originalUrl, baseUrl, proxyBase) {
   if (!originalUrl) return originalUrl;
-  
+
+  // Trim whitespace
+  originalUrl = originalUrl.trim();
+  if (!originalUrl) return originalUrl;
+
   // Skip certain URL types
-  if (originalUrl.startsWith('data:') || 
-      originalUrl.startsWith('javascript:') || 
+  if (originalUrl.startsWith('data:') ||
+      originalUrl.startsWith('javascript:') ||
       originalUrl.startsWith('mailto:') ||
       originalUrl.startsWith('tel:') ||
-      originalUrl === '#') {
+      originalUrl === '#' ||
+      originalUrl.startsWith('blob:')) {
     return originalUrl;
   }
 
   try {
     let absoluteUrl;
-    
+
     // Convert relative URLs to absolute
     if (originalUrl.startsWith('//')) {
       absoluteUrl = 'https:' + originalUrl;
@@ -70,14 +75,15 @@ function rewriteURL(originalUrl, baseUrl, proxyBase) {
 
     // Parse the absolute URL
     const parsedUrl = new URL(absoluteUrl);
-    
+
     // Encode URL as path: /proxy/{protocol}/{host}{path}{search}{hash}
     // This makes URLs self-describing without relying on referers
     const protocol = parsedUrl.protocol.replace(':', ''); // http or https
     const encodedPath = `${proxyBase}/proxy/${protocol}/${parsedUrl.host}${parsedUrl.pathname}${parsedUrl.search}${parsedUrl.hash}`;
-    
+
     return encodedPath;
   } catch (e) {
+    console.error(`Failed to rewrite URL: ${originalUrl}`, e.message);
     return originalUrl;
   }
 }
@@ -92,13 +98,11 @@ function rewriteHTML(html, baseUrl, proxyBase) {
     $('meta[http-equiv="X-Frame-Options"]').remove();
     $('meta[name="referrer"]').remove();  // Remove referrer policy meta tags
 
-    // Add permissive referrer policy and base tag for relative URLs
+    // Add permissive referrer policy
     const parsedBase = new URL(baseUrl);
-    const proxyBasePath = `${proxyBase}/proxy/${parsedBase.protocol.replace(':', '')}/${parsedBase.host}`;
 
     $('head').prepend(`
       <meta name="referrer" content="unsafe-url">
-      <base href="${proxyBasePath}/">
     `);
 
     // Inject JavaScript to intercept navigation and fetch requests
@@ -236,26 +240,19 @@ function rewriteCSS(css, baseUrl, proxyBase) {
 }
 
 // Main proxy endpoint - handles both query-based (?url=) and path-based (/protocol/host/path)
-app.all('/proxy/:protocol?/:host?/*?', (req, res) => {
+app.all('/proxy*', (req, res, next) => {
   let targetUrl = null;
-  
-  // Check if using new path-based format: /proxy/https/example.com/path
-  if (req.params.protocol && req.params.host) {
-    const protocol = req.params.protocol;
-    const host = req.params.host;
-    
-    // Use originalUrl to preserve exact query string and encoded characters
-    const originalPath = req.originalUrl;
-    const proxyPrefix = `/proxy/${protocol}/${host}`;
-    
-    // Extract everything after /proxy/protocol/host to preserve exact encoding
-    let pathAndQuery = '/';
-    const prefixIndex = originalPath.indexOf(proxyPrefix);
-    if (prefixIndex !== -1) {
-      pathAndQuery = originalPath.substring(prefixIndex + proxyPrefix.length) || '/';
-    }
-    
-    targetUrl = `${protocol}://${host}${pathAndQuery}`;
+
+  // Extract path after /proxy
+  const fullPath = req.path; // e.g., '/proxy/https/example.com/page' or '/proxy'
+
+  // Try to match path-based format: /proxy/https/example.com/path
+  const pathMatch = fullPath.match(/^\/proxy\/(https?)\/([\w.-]+(?:\:\d+)?)(.*)$/);
+
+  if (pathMatch) {
+    const [, protocol, host, path] = pathMatch;
+    const queryString = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+    targetUrl = `${protocol}://${host}${path || '/'}${queryString}`;
   }
   // Fall back to query-based format: /proxy?url=https://example.com
   else if (req.query.url) {
@@ -265,6 +262,7 @@ app.all('/proxy/:protocol?/:host?/*?', (req, res) => {
     } catch (e) {}
   }
 
+  // If this is just /proxy with no params, return error
   if (!targetUrl) {
     return res.status(400).json({
       error: 'Missing URL',
