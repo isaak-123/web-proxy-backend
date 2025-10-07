@@ -153,6 +153,23 @@ function rewriteHTML(html, baseUrl, proxyBase) {
             const proxiedUrl = toProxyURL(url);
             return originalOpen.call(this, method, proxiedUrl, ...args);
           };
+
+          // Intercept form submissions
+          document.addEventListener('DOMContentLoaded', function() {
+            document.addEventListener('submit', function(e) {
+              const form = e.target;
+              if (form.tagName === 'FORM') {
+                let action = form.getAttribute('action');
+                // If no action, form submits to current page
+                if (!action || action === '') {
+                  action = window.location.pathname + window.location.search;
+                }
+                const proxiedAction = toProxyURL(action);
+                console.log('[Form Submit]', action, '->', proxiedAction);
+                form.setAttribute('action', proxiedAction);
+              }
+            }, true);
+          });
         })();
       </script>
     `;
@@ -239,6 +256,218 @@ function rewriteCSS(css, baseUrl, proxyBase) {
   }
 }
 
+// YouTube embed handler
+function handleYouTube(targetUrl, res) {
+  try {
+    const urlObj = new URL(targetUrl);
+    let videoId = null;
+
+    // Extract video ID from various YouTube URL formats
+    if (urlObj.hostname.includes('youtube.com')) {
+      if (urlObj.pathname === '/watch') {
+        videoId = urlObj.searchParams.get('v');
+      } else if (urlObj.pathname.startsWith('/embed/')) {
+        videoId = urlObj.pathname.split('/embed/')[1].split('?')[0];
+      } else if (urlObj.pathname.startsWith('/v/')) {
+        videoId = urlObj.pathname.split('/v/')[1].split('?')[0];
+      }
+
+      // Handle search queries
+      if (urlObj.pathname === '/results' || urlObj.pathname.startsWith('/search')) {
+        const searchQuery = urlObj.searchParams.get('search_query') || urlObj.searchParams.get('q');
+        if (searchQuery) {
+          return res.send(createYouTubeSearchPage(searchQuery));
+        }
+      }
+    } else if (urlObj.hostname === 'youtu.be') {
+      videoId = urlObj.pathname.substring(1).split('?')[0];
+    }
+
+    if (videoId) {
+      return res.send(createYouTubeEmbedPage(videoId, targetUrl));
+    }
+
+    // If no video ID found, show YouTube home with search
+    return res.send(createYouTubeHomePage());
+  } catch (e) {
+    console.error('YouTube handler error:', e.message);
+    return null;
+  }
+}
+
+function createYouTubeEmbedPage(videoId, originalUrl) {
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>YouTube Video Player</title>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0f0f0f; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        .container { max-width: 1280px; margin: 0 auto; padding: 20px; }
+        .video-wrapper { position: relative; width: 100%; padding-bottom: 56.25%; background: #000; border-radius: 12px; overflow: hidden; }
+        .video-wrapper iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
+        .info { background: #272727; padding: 16px; margin-top: 12px; border-radius: 12px; color: #fff; }
+        .info h1 { font-size: 20px; margin-bottom: 8px; }
+        .info a { color: #3ea6ff; text-decoration: none; }
+        .info a:hover { text-decoration: underline; }
+        .search-bar { background: #272727; padding: 12px; margin-bottom: 20px; border-radius: 12px; display: flex; gap: 12px; }
+        .search-bar input { flex: 1; padding: 10px 16px; border: 1px solid #303030; background: #121212; color: #fff; border-radius: 24px; outline: none; font-size: 16px; }
+        .search-bar input:focus { border-color: #3ea6ff; }
+        .search-bar button { padding: 10px 24px; background: #3ea6ff; color: #fff; border: none; border-radius: 24px; cursor: pointer; font-weight: 500; }
+        .search-bar button:hover { background: #2e95e8; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="search-bar">
+          <input type="text" id="searchInput" placeholder="Search YouTube..." onkeypress="if(event.key==='Enter') searchYouTube()">
+          <button onclick="searchYouTube()">Search</button>
+        </div>
+        <div class="video-wrapper">
+          <iframe
+            src="https://www.youtube.com/embed/${videoId}?autoplay=1&rel=0"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            allowfullscreen>
+          </iframe>
+        </div>
+        <div class="info">
+          <h1>YouTube Video Player</h1>
+          <p>Video ID: ${videoId}</p>
+          <p><a href="${originalUrl}" target="_blank">Open on YouTube</a></p>
+        </div>
+      </div>
+      <script>
+        function searchYouTube() {
+          const query = document.getElementById('searchInput').value.trim();
+          if (query) {
+            window.location.href = '/proxy?url=https://www.youtube.com/results?search_query=' + encodeURIComponent(query);
+          }
+        }
+      </script>
+    </body>
+    </html>
+  `;
+}
+
+function createYouTubeSearchPage(query) {
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>YouTube Search: ${query}</title>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0f0f0f; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #fff; }
+        .container { max-width: 1280px; margin: 0 auto; padding: 20px; }
+        .search-bar { background: #272727; padding: 12px; margin-bottom: 20px; border-radius: 12px; display: flex; gap: 12px; }
+        .search-bar input { flex: 1; padding: 10px 16px; border: 1px solid #303030; background: #121212; color: #fff; border-radius: 24px; outline: none; font-size: 16px; }
+        .search-bar input:focus { border-color: #3ea6ff; }
+        .search-bar button { padding: 10px 24px; background: #3ea6ff; color: #fff; border: none; border-radius: 24px; cursor: pointer; font-weight: 500; }
+        .search-bar button:hover { background: #2e95e8; }
+        .message { text-align: center; padding: 40px; background: #272727; border-radius: 12px; }
+        .message h2 { margin-bottom: 16px; }
+        .message p { color: #aaa; margin-bottom: 24px; }
+        .message a { display: inline-block; padding: 12px 24px; background: #3ea6ff; color: #fff; text-decoration: none; border-radius: 24px; }
+        .message a:hover { background: #2e95e8; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="search-bar">
+          <input type="text" id="searchInput" placeholder="Search YouTube..." value="${query}" onkeypress="if(event.key==='Enter') searchYouTube()">
+          <button onclick="searchYouTube()">Search</button>
+        </div>
+        <div class="message">
+          <h2>Search Results for: "${query}"</h2>
+          <p>To watch a video, paste a YouTube video URL in the search bar above</p>
+          <p style="margin-top: 16px; color: #888; font-size: 14px;">Supported formats:</p>
+          <p style="color: #888; font-size: 14px;">
+            • https://youtube.com/watch?v=VIDEO_ID<br>
+            • https://youtu.be/VIDEO_ID<br>
+            • https://youtube.com/embed/VIDEO_ID
+          </p>
+          <a href="https://youtube.com/results?search_query=${encodeURIComponent(query)}" target="_blank">Search on YouTube.com</a>
+        </div>
+      </div>
+      <script>
+        function searchYouTube() {
+          const query = document.getElementById('searchInput').value.trim();
+          if (query) {
+            // Check if it's a YouTube URL
+            if (query.includes('youtube.com') || query.includes('youtu.be')) {
+              window.location.href = '/proxy?url=' + encodeURIComponent(query);
+            } else {
+              window.location.href = '/proxy?url=https://www.youtube.com/results?search_query=' + encodeURIComponent(query);
+            }
+          }
+        }
+      </script>
+    </body>
+    </html>
+  `;
+}
+
+function createYouTubeHomePage() {
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>YouTube Player</title>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0f0f0f; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #fff; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .container { max-width: 600px; padding: 40px; text-align: center; }
+        .logo { font-size: 48px; font-weight: 700; margin-bottom: 32px; background: linear-gradient(45deg, #ff0000, #cc0000); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .search-bar { background: #272727; padding: 12px; margin-bottom: 20px; border-radius: 12px; display: flex; gap: 12px; }
+        .search-bar input { flex: 1; padding: 12px 20px; border: 1px solid #303030; background: #121212; color: #fff; border-radius: 24px; outline: none; font-size: 16px; }
+        .search-bar input:focus { border-color: #3ea6ff; }
+        .search-bar button { padding: 12px 28px; background: #3ea6ff; color: #fff; border: none; border-radius: 24px; cursor: pointer; font-weight: 500; font-size: 16px; }
+        .search-bar button:hover { background: #2e95e8; }
+        .info { color: #aaa; font-size: 14px; line-height: 1.6; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="logo">YouTube</div>
+        <div class="search-bar">
+          <input type="text" id="searchInput" placeholder="Paste YouTube video URL or search..." onkeypress="if(event.key==='Enter') handleSearch()">
+          <button onclick="handleSearch()">Go</button>
+        </div>
+        <div class="info">
+          <p>Paste a YouTube video URL or enter a search term</p>
+          <p style="margin-top: 12px;">Supported formats:</p>
+          <p>
+            • https://youtube.com/watch?v=VIDEO_ID<br>
+            • https://youtu.be/VIDEO_ID<br>
+            • Or just search for videos
+          </p>
+        </div>
+      </div>
+      <script>
+        function handleSearch() {
+          const input = document.getElementById('searchInput').value.trim();
+          if (input) {
+            // Check if it's a YouTube URL
+            if (input.includes('youtube.com') || input.includes('youtu.be')) {
+              window.location.href = '/proxy?url=' + encodeURIComponent(input);
+            } else {
+              window.location.href = '/proxy?url=https://www.youtube.com/results?search_query=' + encodeURIComponent(input);
+            }
+          }
+        }
+      </script>
+    </body>
+    </html>
+  `;
+}
+
 // Main proxy endpoint - handles both query-based (?url=) and path-based (/protocol/host/path)
 app.all('/proxy*', (req, res, next) => {
   let targetUrl = null;
@@ -280,6 +509,14 @@ app.all('/proxy*', (req, res, next) => {
     });
   }
 
+  // Check if this is a YouTube URL and handle it specially
+  if (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be')) {
+    const youtubeResponse = handleYouTube(targetUrl, res);
+    if (youtubeResponse !== null) {
+      return; // Response already sent
+    }
+  }
+
   console.log(`[${req.method}] Proxying: ${targetUrl}`);
 
   const proxyBase = getProxyBase(req);
@@ -318,6 +555,8 @@ app.all('*', (req, res) => {
   // Try to extract origin from referer for JavaScript-generated requests
   const referer = req.headers.referer || req.headers.referrer;
 
+  console.log(`[CATCHALL] ${req.method} ${req.path} - Referer: ${referer || 'none'}`);
+
   if (referer) {
     try {
       const refererUrl = new URL(referer);
@@ -329,7 +568,7 @@ app.all('*', (req, res) => {
         const [, protocol, host] = pathMatch;
         const targetUrl = `${protocol}://${host}${req.path}${req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : ''}`;
 
-        console.log(`[CATCHALL ${req.method}] JS request reconstructed: ${targetUrl}`);
+        console.log(`[CATCHALL ${req.method}] Reconstructed from path: ${targetUrl}`);
 
         const proxyBase = getProxyBase(req);
         const options = {
@@ -340,7 +579,8 @@ app.all('*', (req, res) => {
             'Accept': req.headers.accept || '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate',
-            'Referer': `${protocol}://${host}`
+            'Referer': `${protocol}://${host}`,
+            'Origin': `${protocol}://${host}`
           },
           encoding: null,
           followRedirect: true,
@@ -366,7 +606,7 @@ app.all('*', (req, res) => {
           const baseUrl = new URL(urlParam);
           const targetUrl = `${baseUrl.protocol}//${baseUrl.host}${req.path}${req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : ''}`;
 
-          console.log(`[CATCHALL ${req.method}] JS request reconstructed from query: ${targetUrl}`);
+          console.log(`[CATCHALL ${req.method}] Reconstructed from query: ${targetUrl}`);
 
           const proxyBase = getProxyBase(req);
           const options = {
@@ -377,7 +617,8 @@ app.all('*', (req, res) => {
               'Accept': req.headers.accept || '*/*',
               'Accept-Language': 'en-US,en;q=0.9',
               'Accept-Encoding': 'gzip, deflate',
-              'Referer': `${baseUrl.protocol}//${baseUrl.host}`
+              'Referer': `${baseUrl.protocol}//${baseUrl.host}`,
+              'Origin': `${baseUrl.protocol}//${baseUrl.host}`
             },
             encoding: null,
             followRedirect: true,
@@ -398,6 +639,9 @@ app.all('*', (req, res) => {
           console.error('Query-based catchall error:', e.message);
         }
       }
+
+      // If referer doesn't match our proxy patterns, log more details
+      console.log(`[CATCHALL] Referer pathname: ${refererUrl.pathname}, search: ${refererUrl.search}`);
     } catch (e) {
       console.error('Catchall referer parse error:', e.message);
     }
