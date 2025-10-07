@@ -540,9 +540,25 @@ app.all('/proxy*', (req, res, next) => {
 
   // Forward POST/PUT data
   if (req.method === 'POST' || req.method === 'PUT') {
-    options.body = req.body;
-    if (req.headers['content-type']) {
-      options.headers['Content-Type'] = req.headers['content-type'];
+    const contentType = req.headers['content-type'] || '';
+
+    if (contentType.includes('application/json')) {
+      options.json = req.body;
+      options.headers['Content-Type'] = 'application/json';
+    } else if (contentType.includes('application/x-www-form-urlencoded')) {
+      options.form = req.body;
+      options.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    } else if (contentType.includes('multipart/form-data')) {
+      options.formData = req.body;
+      options.headers['Content-Type'] = contentType;
+    } else if (typeof req.body === 'string' || Buffer.isBuffer(req.body)) {
+      options.body = req.body;
+      if (contentType) {
+        options.headers['Content-Type'] = contentType;
+      }
+    } else {
+      // Default: use form encoding for objects
+      options.form = req.body;
     }
   }
 
@@ -590,9 +606,24 @@ app.all('*', (req, res) => {
         };
 
         if (req.method === 'POST' || req.method === 'PUT') {
-          options.body = req.body;
-          if (req.headers['content-type']) {
-            options.headers['Content-Type'] = req.headers['content-type'];
+          const contentType = req.headers['content-type'] || '';
+
+          if (contentType.includes('application/json')) {
+            options.json = req.body;
+            options.headers['Content-Type'] = 'application/json';
+          } else if (contentType.includes('application/x-www-form-urlencoded')) {
+            options.form = req.body;
+            options.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+          } else if (contentType.includes('multipart/form-data')) {
+            options.formData = req.body;
+            options.headers['Content-Type'] = contentType;
+          } else if (typeof req.body === 'string' || Buffer.isBuffer(req.body)) {
+            options.body = req.body;
+            if (contentType) {
+              options.headers['Content-Type'] = contentType;
+            }
+          } else {
+            options.form = req.body;
           }
         }
 
@@ -628,9 +659,24 @@ app.all('*', (req, res) => {
           };
 
           if (req.method === 'POST' || req.method === 'PUT') {
-            options.body = req.body;
-            if (req.headers['content-type']) {
-              options.headers['Content-Type'] = req.headers['content-type'];
+            const contentType = req.headers['content-type'] || '';
+
+            if (contentType.includes('application/json')) {
+              options.json = req.body;
+              options.headers['Content-Type'] = 'application/json';
+            } else if (contentType.includes('application/x-www-form-urlencoded')) {
+              options.form = req.body;
+              options.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+            } else if (contentType.includes('multipart/form-data')) {
+              options.formData = req.body;
+              options.headers['Content-Type'] = contentType;
+            } else if (typeof req.body === 'string' || Buffer.isBuffer(req.body)) {
+              options.body = req.body;
+              if (contentType) {
+                options.headers['Content-Type'] = contentType;
+              }
+            } else {
+              options.form = req.body;
             }
           }
 
