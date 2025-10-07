@@ -13,9 +13,11 @@ app.use(express.urlencoded({ extended: true }));
 // CORS headers for all responses
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cookie, Set-Cookie');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Expose-Headers', 'Set-Cookie, Content-Length, Content-Type');
+
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
@@ -117,7 +119,8 @@ function rewriteHTML(html, baseUrl, proxyBase) {
           function toProxyURL(url) {
             try {
               if (!url || url.startsWith('data:') || url.startsWith('javascript:') ||
-                  url.startsWith('mailto:') || url.startsWith('tel:') || url === '#') {
+                  url.startsWith('mailto:') || url.startsWith('tel:') || url === '#' ||
+                  url.startsWith('blob:') || url.startsWith('about:')) {
                 return url;
               }
 
@@ -140,18 +143,30 @@ function rewriteHTML(html, baseUrl, proxyBase) {
             }
           }
 
-          // Intercept fetch
+          // Intercept fetch with credentials support
           const originalFetch = window.fetch;
           window.fetch = function(url, options) {
             const proxiedUrl = toProxyURL(url);
-            return originalFetch(proxiedUrl, options);
+            // Ensure credentials are included for social media APIs
+            const modifiedOptions = options || {};
+            if (!modifiedOptions.credentials) {
+              modifiedOptions.credentials = 'include';
+            }
+            return originalFetch(proxiedUrl, modifiedOptions);
           };
 
-          // Intercept XMLHttpRequest
+          // Intercept XMLHttpRequest with credentials
           const originalOpen = XMLHttpRequest.prototype.open;
           XMLHttpRequest.prototype.open = function(method, url, ...args) {
             const proxiedUrl = toProxyURL(url);
             return originalOpen.call(this, method, proxiedUrl, ...args);
+          };
+
+          // Set withCredentials for all XHR requests
+          const originalSend = XMLHttpRequest.prototype.send;
+          XMLHttpRequest.prototype.send = function(...args) {
+            this.withCredentials = true;
+            return originalSend.apply(this, args);
           };
 
           // Intercept form submissions
@@ -169,6 +184,38 @@ function rewriteHTML(html, baseUrl, proxyBase) {
                 form.setAttribute('action', proxiedAction);
               }
             }, true);
+          });
+
+          // Intercept dynamic script/image loading
+          const observer = new MutationObserver(function(mutations) {
+            mutations.forEach(function(mutation) {
+              mutation.addedNodes.forEach(function(node) {
+                if (node.tagName === 'SCRIPT' && node.src) {
+                  const originalSrc = node.src;
+                  const proxiedSrc = toProxyURL(originalSrc);
+                  if (originalSrc !== proxiedSrc) {
+                    node.src = proxiedSrc;
+                  }
+                } else if (node.tagName === 'IMG' && node.src) {
+                  const originalSrc = node.src;
+                  const proxiedSrc = toProxyURL(originalSrc);
+                  if (originalSrc !== proxiedSrc) {
+                    node.src = proxiedSrc;
+                  }
+                } else if (node.tagName === 'LINK' && node.href) {
+                  const originalHref = node.href;
+                  const proxiedHref = toProxyURL(originalHref);
+                  if (originalHref !== proxiedHref) {
+                    node.href = proxiedHref;
+                  }
+                }
+              });
+            });
+          });
+
+          observer.observe(document.documentElement, {
+            childList: true,
+            subtree: true
           });
         })();
       </script>
@@ -521,22 +568,46 @@ app.all('/proxy*', (req, res, next) => {
 
   const proxyBase = getProxyBase(req);
 
+  // Parse target URL to get origin
+  const targetUrlObj = new URL(targetUrl);
+
   // Request options
   const options = {
     url: targetUrl,
     method: req.method,
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': req.headers.accept || '*/*',
+      'Accept': req.headers.accept || 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
       'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Referer': `${targetUrlObj.protocol}//${targetUrlObj.host}/`,
+      'Origin': `${targetUrlObj.protocol}//${targetUrlObj.host}`,
+      'DNT': '1',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1',
+      'Sec-Fetch-Dest': req.headers['sec-fetch-dest'] || 'document',
+      'Sec-Fetch-Mode': req.headers['sec-fetch-mode'] || 'navigate',
+      'Sec-Fetch-Site': req.headers['sec-fetch-site'] || 'none',
+      'Sec-Fetch-User': '?1',
+      'Cache-Control': 'max-age=0'
     },
     encoding: null, // Get response as Buffer
     followRedirect: true,
     maxRedirects: 5,
     timeout: 30000,
-    gzip: true
+    gzip: true,
+    jar: true // Enable cookie jar for session management
   };
+
+  // Forward cookies if present
+  if (req.headers.cookie) {
+    options.headers['Cookie'] = req.headers.cookie;
+  }
+
+  // Forward authorization headers (for social media APIs)
+  if (req.headers.authorization) {
+    options.headers['Authorization'] = req.headers.authorization;
+  }
 
   // Forward POST/PUT data
   if (req.method === 'POST' || req.method === 'PUT') {
@@ -740,6 +811,11 @@ function proxyRequest(options, res, targetUrl, proxyBase) {
     res.set('X-Frame-Options', 'ALLOWALL');
     // Set a permissive referrer policy to ensure referers are sent
     res.set('Referrer-Policy', 'unsafe-url');
+
+    // Forward Set-Cookie headers if present (for social media login/sessions)
+    if (response.headers['set-cookie']) {
+      res.set('Set-Cookie', response.headers['set-cookie']);
+    }
 
     try {
       // Handle HTML
